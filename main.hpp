@@ -1,5 +1,7 @@
 #pragma once
 #include "ui/ui.hpp"
+#include "keyauth.hpp"
+#include "config.hpp"
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3d11.lib")
@@ -20,9 +22,19 @@ void CleanupRenderTarget( );
 
 class c_main {
 private:
+    KeyAuth keyauth{Config::KEYAUTH_APP_NAME, Config::KEYAUTH_APP_SECRET, Config::KEYAUTH_APP_VERSION};
+    bool keyauth_initialized = false;
+    KeyAuth::AuthResult current_user;
 
 public:
     void initialize( ImGuiIO& io ) {
+        // Initialize KeyAuth
+        keyauth_initialized = keyauth.init();
+        if (!keyauth_initialized) {
+            // Handle initialization error
+            MessageBoxA(NULL, "Failed to initialize KeyAuth. Check your internet connection.", "Error", MB_OK | MB_ICONERROR);
+        }
+
         StyleColorsDark( );
 
         auto style = &ImGui::GetStyle( );
@@ -32,39 +44,102 @@ public:
         config.FontDataOwnedByAtlas = false;
         config.FontBuilderFlags |= ImGuiFreeTypeBuilderFlags::ImGuiFreeTypeBuilderFlags_MonoHinting;
 
-        fonts[font].set_data( "C:\\Windows\\Fonts\\tahoma.ttf" );
+        fonts[font].set_data( Config::FONT_PATH.c_str() );
         fonts[font].set_config( config );
-        fonts[font].init( { 13 } );
+        fonts[font].init( { Config::FONT_SIZE } );
 
         ImGuiFreeType::BuildFontAtlas( io.Fonts );
 
-        add_page( 0, [ ]( ){
-            static char buf[32];
-            static char buf1[32];
-
-            static bool save = false;
-            static const char* error_msg = "";
+        add_page( 0, [this]( ){
+            static char username_buf[64] = "";
+            static char password_buf[64] = "";
+            static char license_buf[128] = "";
+            static int login_mode = 0; // 0 = username/password, 1 = license key
+            static bool save_credentials = false;
+            static std::string error_msg = "";
+            static bool is_logging_in = false;
 
             BeginGroup( ); {
-                begin_child( "Details" ); {
+                begin_child( "Authentication" ); {
                     PushStyleVar( ImGuiStyleVar_ItemSpacing, { 11, 9 } );
                     PushStyleVar( ImGuiStyleVar_WindowPadding, { 15, 13 } );
-                    BeginChild( "details wrapper", GetContentRegionAvail( ), 0, ImGuiWindowFlags_AlwaysUseWindowPadding ); {
-                        InputText( "Username", buf, sizeof( buf ) );
-                        InputText( "Password", buf1, sizeof( buf1 ), ImGuiInputTextFlags_Password );
+                    BeginChild( "auth wrapper", GetContentRegionAvail( ), 0, ImGuiWindowFlags_AlwaysUseWindowPadding ); {
+                        
+                        // Login mode selection
+                        if (RadioButton("Username/Password", login_mode == 0)) login_mode = 0;
+                        SameLine();
+                        if (RadioButton("License Key", login_mode == 1)) login_mode = 1;
+                        
+                        Dummy({ 0, 5 });
+
+                        if (login_mode == 0) {
+                            // Username/Password login
+                            InputText( "Username", username_buf, sizeof( username_buf ) );
+                            InputText( "Password", password_buf, sizeof( password_buf ), ImGuiInputTextFlags_Password );
+                        } else {
+                            // License key login
+                            InputText( "License Key", license_buf, sizeof( license_buf ) );
+                        }
+                        
                         Dummy({ 0, 0 });
 
-                        if ( text_size( font, 13, error_msg ).x > 0 )
-                            add_text( font, 13, { GetWindowPos( ).x + GetCursorPosX( ) + CalcItemWidth( ) / 2 - text_size( font, 13, error_msg ).x / 2, GetWindowPos( ).y + GetCursorPosY( ) - 13 - GImGui->Style.ItemSpacing.y / 2 + 1 }, GetColorU32( ImGuiCol_Text ), error_msg, FindRenderedTextEnd( error_msg ) );
-
-                        if ( Button( "Log in", { CalcItemWidth( ), 24 } ) ) {
-                            if ( save ) error_msg = "Unexpected error";
-                            else cur_page = 1;
+                        // Display error message if any
+                        if ( !error_msg.empty() ) {
+                            PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
+                            add_text( font, Config::FONT_SIZE, { GetWindowPos( ).x + GetCursorPosX( ) + CalcItemWidth( ) / 2 - text_size( font, Config::FONT_SIZE, error_msg.c_str() ).x / 2, GetWindowPos( ).y + GetCursorPosY( ) - Config::FONT_SIZE - GImGui->Style.ItemSpacing.y / 2 + 1 }, GetColorU32( ImGuiCol_Text ), error_msg.c_str(), FindRenderedTextEnd( error_msg.c_str() ) );
+                            PopStyleColor();
                         }
+
+                        // Login button
+                        PushItemFlag(ImGuiItemFlags_Disabled, is_logging_in || !keyauth_initialized);
+                        if ( Button( is_logging_in ? "Logging in..." : "Log in", { CalcItemWidth( ), 24 } ) ) {
+                            is_logging_in = true;
+                            error_msg = "";
+                            
+                            KeyAuth::AuthResult result;
+                            if (login_mode == 0) {
+                                // Username/Password login
+                                if (strlen(username_buf) == 0 || strlen(password_buf) == 0) {
+                                    error_msg = "Please enter username and password";
+                                    is_logging_in = false;
+                                } else {
+                                    result = keyauth.login(username_buf, password_buf);
+                                }
+                            } else {
+                                // License key login
+                                if (strlen(license_buf) == 0) {
+                                    error_msg = "Please enter license key";
+                                    is_logging_in = false;
+                                } else {
+                                    result = keyauth.license_login(license_buf);
+                                }
+                            }
+                            
+                            if (is_logging_in) {
+                                if (result.success) {
+                                    current_user = result;
+                                    cur_page = 1;
+                                    error_msg = "";
+                                } else {
+                                    error_msg = result.message;
+                                }
+                                is_logging_in = false;
+                            }
+                        }
+                        PopItemFlag();
+                        
                         if ( Button( "Exit", { CalcItemWidth( ), 24 } ) ) {
                             exit( 0 );
                         }
-                        Checkbox( "Save credentials", &save );
+                        
+                        Checkbox( "Save credentials", &save_credentials );
+                        
+                        if (!keyauth_initialized) {
+                            Dummy({ 0, 5 });
+                            PushStyleColor(ImGuiCol_Text, IM_COL32(255, 200, 100, 255));
+                            TextWrapped("KeyAuth initialization failed. Please check your internet connection and app configuration.");
+                            PopStyleColor();
+                        }
                     }
                     EndChild( );
                     PopStyleVar( 2 );
@@ -74,7 +149,12 @@ public:
             EndGroup( );
         } );
 
-        add_page( 1, [ ]( ){
+        add_page( 1, [this]( ){
+            // Validate user session
+            if (!keyauth.is_logged_in()) {
+                cur_page = 0; // Redirect to login
+                return;
+            }
             static int cur_game = 0;
             static std::vector< const char* > games = { "ROBLOX" };
 
@@ -127,11 +207,21 @@ public:
                             last_update = std::chrono::steady_clock::now( );
                             stages = { "Resolving imports", "Retrieving data" };
                         }
+                        
+                        if ( Button( "Logout", { CalcItemWidth( ), 24 } ) ) {
+                            keyauth.logout();
+                            cur_page = 0;
+                        }
 
                         PopItemFlag( );
                         
-                        CenterText( "Welcome back," );
-                        CenterText( "Sub expiration:" );
+                        if (keyauth.is_logged_in()) {
+                            CenterTextF( "Welcome back, %s", current_user.username.c_str() );
+                            CenterTextF( "Subscription: %s", current_user.subscription.c_str() );
+                            CenterTextF( "Expires: %s", current_user.expiry.c_str() );
+                        } else {
+                            CenterText( "Not logged in" );
+                        }
 
                         if ( !stages.empty( ) ) {
                             auto now = std::chrono::steady_clock::now( );
@@ -184,7 +274,7 @@ public:
                 GetWindowDrawList( )->AddLine( { GetWindowPos( ).x, GetWindowPos( ).y + GetWindowHeight( ) - 2 }, { GetWindowPos( ).x + GetWindowWidth( ), GetWindowPos( ).y + GetWindowHeight( ) - 2 }, GetColorU32( ImGuiCol_Border ) );
                 GetWindowDrawList( )->AddRectFilledMultiColor( { GetWindowPos( ).x + GetWindowWidth( ) / 2, GetWindowPos( ).y + GetWindowHeight( ) - 1 }, { GetWindowPos( ).x + GetWindowWidth( ), GetWindowPos( ).y + GetWindowHeight( ) }, GetColorU32( ImGuiCol_Scheme, 0 ), GetColorU32( ImGuiCol_Scheme ), GetColorU32( ImGuiCol_Scheme ), GetColorU32( ImGuiCol_Scheme, 0 ) );
 
-                add_text( font, 13, { GetWindowPos( ).x + 6, GetWindowPos( ).y + GetWindowHeight( ) / 2 - 13 / 2 - 2 }, GetColorU32( ImGuiCol_Scheme ), "pooron.solutions" );
+                add_text( font, Config::FONT_SIZE, { GetWindowPos( ).x + 6, GetWindowPos( ).y + GetWindowHeight( ) / 2 - Config::FONT_SIZE / 2 - 2 }, GetColorU32( ImGuiCol_Scheme ), Config::APP_TITLE.c_str() );
             }
             EndChild( );
 
@@ -215,8 +305,13 @@ public:
                 GetWindowDrawList( )->AddLine( GetWindowPos( ), { GetWindowPos( ).x + GetWindowWidth( ), GetWindowPos( ).y }, GetColorU32( ImGuiCol_Border ) );
                 GetWindowDrawList( )->AddLine( { GetWindowPos( ).x, GetWindowPos( ).y + 1 }, { GetWindowPos( ).x + GetWindowWidth( ), GetWindowPos( ).y + 1 }, GetColorU32( ImGuiCol_BorderShadow ) );
 
-                add_text( font, 13, { GetWindowPos( ).x + 6, GetWindowPos( ).y + GetWindowHeight( ) / 2 - 13 / 2 - 1 }, GetColorU32( ImGuiCol_TextDisabled ), "Jun  10" );
-                add_text( font, 13, { GetWindowPos( ).x + 6 + text_size( font, 13, "" ).x, GetWindowPos( ).y + GetWindowHeight( ) / 2 - 13 / 2 - 1 }, GetColorU32( ImGuiCol_Scheme ), "2025" );
+                // Get current date
+                time_t now = time(0);
+                tm* ltm = localtime(&now);
+                char date_str[32];
+                strftime(date_str, sizeof(date_str), "%b %d %Y", ltm);
+                
+                add_text( font, Config::FONT_SIZE, { GetWindowPos( ).x + 6, GetWindowPos( ).y + GetWindowHeight( ) / 2 - Config::FONT_SIZE / 2 - 1 }, GetColorU32( ImGuiCol_TextDisabled ), date_str );
             }
             EndChild( );
         }
